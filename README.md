@@ -1,6 +1,21 @@
 # 在线客服 Agent
 
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg) [![CI](https://github.com/X33834/online-cs-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/X33834/online-cs-agent/actions/workflows/ci.yml) ![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg) ![FastAPI](https://img.shields.io/badge/FastAPI-009688.svg) ![React](https://img.shields.io/badge/React-18-61DAFB.svg)
+
 基于 Web 全栈的在线客服答疑 Agent。访客自助提问，Agent 基于知识库（RAG）+ LLM 回答；解决不了自动升级人工坐席，坐席在工作台接管并回复（WebSocket 实时推送）。
+
+## 架构
+
+```mermaid
+flowchart LR
+    V[访客聊天页 /] -->|HTTP /api| GW[FastAPI 网关]
+    V -->|WebSocket /ws| GW
+    GW --> AG["Agent 核心（RAG 检索 + 规则/LLM）"]
+    AG --> KB[(知识库 kb.json)]
+    AG --> DB[(SQLite：sessions / messages / tickets)]
+    O[坐席工作台 /operator] -->|接管 / 回复| GW
+    GW -.->|未命中转人工| O
+```
 
 ## 技术栈
 
