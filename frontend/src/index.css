@@ -1,0 +1,5 @@
+/* Tailwind 入口 — 豆包设计 token 在 styles.css 的 :root 中定义，
+   Tailwind 仅在此做原子类层叠，保留既有视觉。 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 import storage
 import agent_core
+import config_store
 
 app = FastAPI(title="Online CS Agent")
 app.add_middleware(
@@ -32,6 +33,10 @@ class FeedbackIn(BaseModel):
     message_id: int | None = None
     rating: str  # helpful | not_helpful
     comment: str = ""
+
+
+class ConfigIn(BaseModel):
+    config: dict  # 顶层分组 -> 该分组下的键值
 
 
 # ---- in-memory broadcast hub for operator -> visitor real-time push ----
@@ -100,9 +105,9 @@ async def post_message(sid: str, body: MessageIn):
     if not content and not body.image:
         raise HTTPException(400, "empty message")
 
-    # 注入护栏检测
-    inj = agent_core.detect_injection(content)
-    if inj:
+    # 注入护栏检测（数据驱动规则：block 拦截，log_only 记录但不阻断）
+    inj, inj_action = agent_core.detect_injection(content)
+    if inj and inj_action == "block":
         storage.add_message(sid, "visitor", content)
         storage.log_injection(sid, visitor_id, content, inj, "blocked")
         storage.add_message(sid, "agent", "检测到越权输入，已拦截并记录。请就具体问题咨询。", tool_used="injection_guard")
@@ -117,14 +122,18 @@ async def post_message(sid: str, body: MessageIn):
             "tool_used": "injection_guard",
             "message_id": None,
         }
+    if inj:
+        # log_only：记录但不阻断
+        storage.log_injection(sid, visitor_id, content, inj, "log_only")
 
     history = storage.get_messages(sid)
     storage.add_message(sid, "visitor", content or "（附图）", image_b64_placeholder=body.image)
 
     answer = agent_core.respond(content or "（附图）", history, visitor_id, body.image or "")
-    # 长期记忆沉淀：记录本条问题的主题
+    # 长期记忆沉淀：记录本条问题的主题 + 自动抽取偏好/事实
     if content:
         storage.set_memory(visitor_id, "last_topic", content[:50])
+        agent_core.capture_memory(content, visitor_id, config_store.get_config())
 
     if answer.escalate:
         storage.mark_escalated(sid, answer.escalate_reason)
@@ -170,6 +179,7 @@ async def post_message(sid: str, body: MessageIn):
         "tool_used": answer.tool_used,
         "tool_result": answer.tool_result,
         "memory_note": answer.memory_note,
+        "ctx_used": answer.ctx_used,
         "message_id": msg_id,
     }
 
@@ -283,10 +293,124 @@ def injection_log(limit: int = 20):
     return {"entries": [dict(r) for r in rows]}
 
 
+# ---------- 运行时配置（高度自定义） ----------
+@app.get("/api/config")
+def get_config():
+    return {"config": config_store.get_config()}
+
+
+@app.put("/api/config")
+def update_config(body: ConfigIn):
+    # 分组级白名单：只允许覆盖已知分组，避免写入任意字段
+    allowed = set(config_store.DEFAULTS.keys())
+    patch = {k: v for k, v in (body.config or {}).items() if k in allowed}
+    return {"config": config_store.update_config(patch)}
+
+
 # ---------- Meta ----------
 @app.get("/api/agent/health")
 def health():
     return agent_core.health()
+
+
+# ---------- 工具注册表（数据驱动，可自定义内部功能） ----------
+class ToolIn(BaseModel):
+    id: str
+    name: str = ""
+    desc: str = ""
+    args_json: dict = {}
+    enabled: bool = True
+
+
+def _validate_tool_args(args_json: dict) -> None:
+    if not isinstance(args_json, dict):
+        raise HTTPException(400, "args_json 必须是参数名→类型的对象")
+    for k, v in args_json.items():
+        if not isinstance(k, str) or not k.isidentifier():
+            raise HTTPException(400, f"参数名 '{k}' 非法")
+
+
+@app.get("/api/tools")
+def list_tools():
+    return {"tools": storage.list_tools()}
+
+
+@app.post("/api/tools")
+def create_tool(body: ToolIn):
+    _validate_tool_args(body.args_json)
+    builtin = 1 if body.id in ("query_order", "initiate_refund", "lookup_policy") else 0
+    try:
+        t = storage.upsert_tool(body.id, body.name, body.desc, body.args_json, body.enabled, builtin)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"tool": t}
+
+
+@app.put("/api/tools/{tool_id}")
+def update_tool(tool_id: str, body: ToolIn):
+    _validate_tool_args(body.args_json)
+    existing = storage.get_tool(tool_id)
+    if not existing:
+        raise HTTPException(404, "tool not found")
+    try:
+        t = storage.upsert_tool(tool_id, body.name or tool_id, body.desc, body.args_json, body.enabled, existing["builtin"])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"tool": t}
+
+
+@app.delete("/api/tools/{tool_id}")
+def delete_tool(tool_id: str):
+    if not storage.delete_tool(tool_id):
+        raise HTTPException(404, "tool not found")
+    return {"ok": True}
+
+
+# ---------- 注入规则（数据驱动护栏） ----------
+class RuleIn(BaseModel):
+    expr: str
+    action: str = "block"
+    enabled: bool = True
+
+
+@app.get("/api/injection-rules")
+def list_rules():
+    return {"rules": storage.list_injection_rules()}
+
+
+@app.post("/api/injection-rules")
+def create_rule(body: RuleIn):
+    import re as _re
+    try:
+        _re.compile(body.expr, _re.IGNORECASE)
+    except _re.error as e:
+        raise HTTPException(400, f"正则表达式非法：{e}")
+    if body.action not in ("block", "log_only"):
+        raise HTTPException(400, "action 必须是 block 或 log_only")
+    r = storage.add_injection_rule(body.expr, body.action, body.enabled)
+    return {"rule": r}
+
+
+@app.put("/api/injection-rules/{rule_id}")
+def update_rule(rule_id: int, body: RuleIn):
+    import re as _re
+    try:
+        _re.compile(body.expr, _re.IGNORECASE)
+    except _re.error as e:
+        raise HTTPException(400, f"正则表达式非法：{e}")
+    if body.action not in ("block", "log_only"):
+        raise HTTPException(400, "action 必须是 block 或 log_only")
+    r = storage.update_injection_rule(rule_id, body.expr, body.action, body.enabled)
+    if not r:
+        raise HTTPException(404, "rule not found")
+    return {"rule": r}
+
+
+@app.delete("/api/injection-rules/{rule_id}")
+def delete_rule(rule_id: int):
+    if not storage.delete_injection_rule(rule_id):
+        raise HTTPException(404, "rule not found")
+    return {"ok": True}
 
 
 @app.get("/api/debug/conn")
@@ -301,6 +425,91 @@ def debug_conn():
 @app.get("/api/kb")
 def kb():
     return {"kb": agent_core._load_kb()}
+
+
+# ---------- 知识库管理（增删改，写回 kb.json） ----------
+class KbIn(BaseModel):
+    id: str
+    text: str = ""
+    title: str = ""
+    answer: str = ""
+    tags: list[str] = []
+
+
+@app.post("/api/kb")
+def add_kb(body: KbIn):
+    items = agent_core._load_kb()
+    if any(e["id"] == body.id for e in items):
+        raise HTTPException(400, "kb id already exists")
+    entry = {"id": body.id, "text": body.text, "title": body.title, "answer": body.answer, "tags": body.tags}
+    items.append(entry)
+    _save_kb(items)
+    return {"kb": items}
+
+
+@app.put("/api/kb/{kb_id}")
+def update_kb(kb_id: str, body: KbIn):
+    items = agent_core._load_kb()
+    for i, e in enumerate(items):
+        if e["id"] == kb_id:
+            items[i] = {"id": kb_id, "text": body.text, "title": body.title, "answer": body.answer, "tags": body.tags}
+            _save_kb(items)
+            return {"kb": items}
+    raise HTTPException(404, "kb not found")
+
+
+@app.delete("/api/kb/{kb_id}")
+def delete_kb(kb_id: str):
+    items = agent_core._load_kb()
+    new = [e for e in items if e["id"] != kb_id]
+    if len(new) == len(items):
+        raise HTTPException(404, "kb not found")
+    _save_kb(new)
+    return {"kb": new}
+
+
+def _save_kb(items: list[dict]) -> None:
+    import pathlib
+    p = pathlib.Path(agent_core.KB_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"kb": items}, f, ensure_ascii=False, indent=2)
+
+
+# ---------- 管理数据面板（反馈 / 记忆 / 注入日志 / 工单） ----------
+class MemIn(BaseModel):
+    visitor_id: str
+    key: str
+    value: str = ""
+
+
+@app.get("/api/admin/overview")
+def admin_overview():
+    with storage.get_conn() as conn:
+        sessions = conn.execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"]
+        messages = conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        tickets = conn.execute("SELECT COUNT(*) c FROM tickets").fetchone()["c"]
+        pending = conn.execute("SELECT COUNT(*) c FROM sessions WHERE status='pending_agent'").fetchone()["c"]
+    return {
+        "sessions": sessions,
+        "messages": messages,
+        "tickets": tickets,
+        "pending": pending,
+        "feedback": storage.feedback_summary(),
+        "kb_count": len(agent_core._load_kb()),
+        "injection": len(storage.injection_log(50)),
+    }
+
+
+@app.get("/api/admin/injection-log")
+def admin_injection_log():
+    return {"entries": storage.injection_log(50)}
+
+
+@app.get("/api/admin/memory")
+def admin_memory():
+    """所有访客的长期记忆（含自动沉淀的偏好/事实）。"""
+    return {"entries": storage.all_memory()}
 
 
 # ---------- WebSocket (operator desk real-time) ----------
